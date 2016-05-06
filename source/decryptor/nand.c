@@ -882,21 +882,6 @@ u32 InjectNandPartition(u32 param)
     return EncryptFileToNand(filename, p_info->offset, p_info->size, p_info);
 }
 
-u32 ValidateNandDump(u32 param)
-{
-    (void) (param); // param is unused here
-    char filename[64];
-        
-    // user file select
-    if (InputFileNameSelector(filename, "NAND.bin", NULL, NULL, 0, NAND_MIN_SIZE, true) != 0)
-        return 1;
-    Debug("Validating NAND dump %s...", filename);
-    if (CheckNandDumpIntegrity(filename) != 0)
-        return 1;
-    
-    return 0;
-}
-
 uint64_t bswap64(uint64_t a)
 {
   a = ((a & 0x00000000000000FFULL) << 56) | 
@@ -951,4 +936,18 @@ u32 DumpAgbSave(u32 parm)
     } else {
         return DecryptNandToFile("agb_dump.sav", p_info->offset + Saveadder, Savesize, p_info);
     }
+}
+u32 ValidateNandDump(u32 param)
+{
+    (void) (param); // param is unused here
+    char filename[64];
+        
+    // user file select
+    if (InputFileNameSelector(filename, "NAND.bin", NULL, NULL, 0, NAND_MIN_SIZE, true) != 0)
+        return 1;
+    Debug("Validating NAND dump %s...", filename);
+    if (CheckNandDumpIntegrity(filename) != 0)
+        return 1;
+    
+    return 0;
 }

@@ -40,7 +40,11 @@ u32 CryptBuffer(CryptBufferInfo *info)
 u32 CreatePad(PadInfo *info)
 {
     u8* buffer = BUFFER_ADDRESS;
+    u32 size_bytes = info->size_mb * 1024*1024;
     u32 result = 0;
+    
+    if (!DebugCheckFreeSpace(size_bytes))
+        return 1;
     
     if (!FileCreate(info->filename, true)) // No DebugFileCreate() here - messages are already given
         return 1;
@@ -48,7 +52,6 @@ u32 CreatePad(PadInfo *info)
     CryptBufferInfo decryptInfo = {.keyslot = info->keyslot, .setKeyY = info->setKeyY, .mode = info->mode, .buffer = buffer};
     memcpy(decryptInfo.ctr, info->ctr, 16);
     memcpy(decryptInfo.keyY, info->keyY, 16);
-    u32 size_bytes = info->size_mb * 1024*1024;
     for (u32 i = 0; i < size_bytes; i += BUFFER_MAX_SIZE) {
         u32 curr_block_size = min(BUFFER_MAX_SIZE, size_bytes - i);
         decryptInfo.size = curr_block_size;

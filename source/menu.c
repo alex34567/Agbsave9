@@ -14,38 +14,28 @@ u32 ScrollOutput()
     u32 log_start = LogWrite(NULL);
     
     // careful, these areas are used by other functions in Decrypt9
-    char** logptr = (char**) 0x20316000;
-    char* logtext = (char*)  0x20400000;
-    u32 log_size = 0; // log size
+    char** logptr = (char**) 0x21100000;
+    char* logtext = (char*)  0x21200000;
+    u32 log_size = FileGetData(LOG_FILE, logtext, 1024 * 1024, log_start); // log size
     u32 l_total = 0; // total lines
     u32 l_curr = 0; // current line
     
-    if (!FileOpen(LOG_FILE))
+    // allow 1MB of text max
+    if ((log_size == 0) || (log_size >= 1024 * 1024))
         return 0;
-    log_size = FileGetSize();
-    if ((log_size <= log_start) || (log_size - log_start >= 1024 * 1024)) {
-        FileClose();
-        return 0; // allow 1MB of text max
-    }
-    log_size -= log_start;
-    if (!FileRead(logtext, log_size, log_start)) {
-        FileClose();
-        return 0;
-    }
-    FileClose();
     
-    // read lines
+    // organize lines
     logtext[log_size - 1] = '\0';
-    for (char* line = logtext; line != NULL && l_total < 4000; line = strchr(line, '\n')) {
+    logptr[l_total++] = logtext;
+    for (char* line = strchr(logtext, '\n'); line != NULL && l_total < 4000; line = strchr(line, '\n')) {
         *line = '\0';
         logptr[l_total++] = ++line; 
     }
     if (l_total >= 4000) // allow 4000 lines of text max
         return 0;
-    for (; l_total < DBG_N_CHARS_Y; logptr[l_total++] = logtext + log_size - 1);
-    
+    for (; l_total < DBG_N_CHARS_Y; logptr[l_total++] = logtext + log_size - 1); // fill up with empty lines
     // here, the actual output starts
-    l_curr = l_total - DBG_N_CHARS_Y ;
+    l_curr = l_total - DBG_N_CHARS_Y;
     if (l_curr > 0) l_curr--; // start at the line before the last
     while (true) {
         DebugSet((const char**) logptr + l_curr);
@@ -69,16 +59,18 @@ u32 UnmountSd()
 {
     u32 pad_state;
     
-    DebugClear();
-    Debug("Unmounting SD card...");
     #ifdef USE_THEME
     LoadThemeGfx(GFX_UNMOUNT, false);
-    #endif
+    DeinitFS();
+    #else
+    DebugClear();
+    Debug("Unmounting SD card...");
     DeinitFS();
     Debug("SD is unmounted, you may remove it now.");
     Debug("Put the SD card back in before pressing B!");
     Debug("");
     Debug("(B to return, START to reboot)");
+    #endif
     while (true) {
         pad_state = InputWait();
         if (((pad_state & BUTTON_B) && InitFS()) || (pad_state & BUTTON_START))
@@ -105,7 +97,7 @@ void DrawMenu(MenuInfo* currMenu, u32 index, bool fullDraw, bool subMenu)
         DrawStringF(menublock_x0, menublock_y1 + 10, top_screen, (subMenu) ? "A: Choose  B: Return" : "A: Choose");
         DrawStringF(menublock_x0, menublock_y1 + 20, top_screen, "SELECT: Unmount SD");
         DrawStringF(menublock_x0, menublock_y1 + 30, top_screen, "START:  Reboot");
-        DrawStringF(menublock_x1, SCREEN_HEIGHT - 20, top_screen, "SD card: %lluMB/%lluMB & %s", RemainingStorageSpace() / 1024 / 1024, TotalStorageSpace() / 1024 / 1024, (emunand_state == EMUNAND_READY) ? "EmuNAND ready" : (emunand_state == EMUNAND_GATEWAY) ? "GW EmuNAND" : (emunand_state == EMUNAND_REDNAND) ? "RedNAND" : "no EmuNAND");
+        DrawStringF(menublock_x1, SCREEN_HEIGHT - 20, top_screen, "SD card: %lluMB/%lluMB & %s", RemainingStorageSpace() / 1024 / 1024, TotalStorageSpace() / 1024 / 1024, (emunand_state == EMUNAND_READY) ? "EmuNAND ready" : (emunand_state == EMUNAND_GATEWAY) ? "GW EmuNAND" : (emunand_state == EMUNAND_REDNAND) ? "RedNAND" : (emunand_state > 3) ? "MultiNAND" : "no EmuNAND");
         DrawStringF(menublock_x1, SCREEN_HEIGHT - 30, top_screen, "Game directory: %s", GAME_DIR);
         if (DirOpen(WORK_DIR)) {
             DrawStringF(menublock_x1, SCREEN_HEIGHT - 40, top_screen, "Work directory: %s", WORK_DIR);
@@ -125,7 +117,7 @@ void DrawMenu(MenuInfo* currMenu, u32 index, bool fullDraw, bool subMenu)
 u32 ProcessEntry(MenuEntry* entry)
 {
     bool emunand    = entry->param & N_EMUNAND;
-    bool nand_force = entry->param & N_FORCENAND;
+    bool nand_force = entry->param & N_FORCEEMU;
     bool warning    = entry->param & N_NANDWRITE;
     
     u32 pad_state;
@@ -214,7 +206,6 @@ void BatchScreenshot(MenuInfo* info, bool full_batch)
 
 u32 ProcessMenu(MenuInfo* info, u32 n_entries_main)
 {
-    MenuInfo mainMenu;
     MenuInfo* currMenu;
     MenuInfo* prevMenu[MENU_MAX_DEPTH];
     u32 prevIndex[MENU_MAX_DEPTH];
@@ -224,6 +215,7 @@ u32 ProcessMenu(MenuInfo* info, u32 n_entries_main)
     u32 result = MENU_EXIT_REBOOT;
     
     #ifndef USE_THEME
+    MenuInfo mainMenu;
     if (n_entries_main > 1) {
         // build main menu structure from submenus
         if (n_entries_main > MENU_MAX_ENTRIES) // limit number of entries
@@ -280,7 +272,7 @@ u32 ProcessMenu(MenuInfo* info, u32 n_entries_main)
             index = (index == 0) ? currMenu->n_entries - 1 : index - 1;
             full_draw = false;
         } else if ((pad_state & BUTTON_R1) && (menuLvl == 1)) {
-            if (++currMenu - info >= n_entries_main) currMenu = info;
+            if (++currMenu >= info + n_entries_main) currMenu = info;
             index = 0;
         } else if ((pad_state & BUTTON_L1) && (menuLvl == 1)) {
             if (--currMenu < info) currMenu = info + n_entries_main - 1;

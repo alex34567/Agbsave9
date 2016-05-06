@@ -5,6 +5,9 @@
 bool InitFS();
 void DeinitFS();
 
+/** Checks if there is enough space free on the SD card **/
+bool DebugCheckFreeSpace(size_t required);
+
 /** Opens existing files */
 bool FileOpen(const char* path);
 bool DebugFileOpen(const char* path);
@@ -43,6 +46,9 @@ bool DirRead(char* fname, int fsize);
 /** Get list of files under a given path **/
 bool GetFileList(const char* path, char* list, int lsize, bool recursive, bool inc_files, bool inc_dirs);
 
+/** Quickly opens a secondary file, gets some data, and closes it again **/
+size_t FileGetData(const char* path, void* buf, size_t size, size_t foffset);
+
 /** Writes text to a constantly open log file **/
 size_t LogWrite(const char* text);
 
@@ -51,6 +57,9 @@ uint64_t RemainingStorageSpace();
 
 /** Gets total space on SD card in bytes */
 uint64_t TotalStorageSpace();
+
+/** Gets number of hidden sectors between MBR and FAT FS **/
+uint32_t NumHiddenSectors();
 
 void FileClose();
 

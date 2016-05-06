@@ -3,4 +3,4 @@ APP_DESCRIPTION = Tool to extract and inject agb_firm saves.
 APP_AUTHOR = Alex34567, Archshift, d0k3, Shadowtrance & others
 
 PAYLOAD_MEM = 1
-VOODOO = 0xF
+VOODOO = 0x3F

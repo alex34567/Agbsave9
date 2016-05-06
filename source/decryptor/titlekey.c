@@ -18,9 +18,10 @@ static const u8 common_keyy[6][16] = {
 };
 
 
-u32 DecryptTitlekey(TitleKeyEntry* entry)
+u32 CryptTitlekey(TitleKeyEntry* entry, bool encrypt)
 {
-    CryptBufferInfo info = {.keyslot = 0x3D, .setKeyY = 1, .size = 16, .buffer = entry->encryptedTitleKey, .mode = AES_CNT_TITLEKEY_DECRYPT_MODE};
+    CryptBufferInfo info = {.keyslot = 0x3D, .setKeyY = 1, .size = 16, .buffer = entry->titleKey,
+        .mode = encrypt ? AES_CNT_TITLEKEY_ENCRYPT_MODE : AES_CNT_TITLEKEY_DECRYPT_MODE};
     memset(info.ctr, 0, 16);
     memcpy(info.ctr, entry->titleId, 8);
     memcpy(info.keyY, (void *)common_keyy[entry->commonKeyIndex], 16);
@@ -30,11 +31,16 @@ u32 DecryptTitlekey(TitleKeyEntry* entry)
     return 0;
 }
 
-u32 DecryptTitlekeysFile(u32 param)
+u32 CryptTitlekeysFile(u32 param)
 {
     EncKeysInfo *info = (EncKeysInfo*)0x20316000;
+    char filename[64];
 
-    if (!DebugFileOpen("encTitleKeys.bin"))
+    if (InputFileNameSelector(filename, (param & TK_ENCRYPTED) ? "decTitleKeys.bin" : "encTitleKeys.bin",
+        NULL, NULL, 0, 16, true) != 0)
+        return 1;
+    
+    if (!DebugFileOpen(filename))
         return 1;
     
     if (!DebugFileRead(info, 16, 0)) {
@@ -56,11 +62,13 @@ u32 DecryptTitlekeysFile(u32 param)
     
     FileClose();
 
-    Debug("Decrypting Title Keys...");
+    Debug("%scrypting Title Keys...", (param & TK_ENCRYPTED) ? "En" : "De");
     for (u32 i = 0; i < info->n_entries; i++)
-        DecryptTitlekey(&(info->entries[i]));
+        CryptTitlekey(&(info->entries[i]), (param & TK_ENCRYPTED));
 
-    if (!DebugFileCreate("decTitleKeys.bin", true))
+    if (OutputFileNameSelector(filename, (param & TK_ENCRYPTED) ? "encTitleKeys.bin" : "decTitleKeys.bin", NULL) != 0)
+        return 1;
+    if (!DebugFileCreate(filename, true))
         return 1;
     if (!DebugFileWrite(info, info->n_entries * sizeof(TitleKeyEntry) + 16, 0)) {
         FileClose();
@@ -71,13 +79,15 @@ u32 DecryptTitlekeysFile(u32 param)
     return 0;
 }
 
-u32 DecryptTitlekeysNand(u32 param)
+u32 DumpTitlekeysNand(u32 param)
 {
     PartitionInfo* ctrnand_info = GetPartitionInfo(P_CTRNAND);;
     u8* buffer = BUFFER_ADDRESS;
     EncKeysInfo *info = (EncKeysInfo*) 0x20316000;
+    char filename[64];
     
     u32 nKeys = 0;
+    u32 nSkipped = 0;
     u32 offset = 0;
     u32 size = 0;
     
@@ -88,28 +98,33 @@ u32 DecryptTitlekeysNand(u32 param)
     }
     Debug("Found at %08X, size %uMB", offset, size / (1024 * 1024));
     
-    Debug("Decrypting Title Keys...");
+    Debug("%s Title Keys...", (param & TK_ENCRYPTED) ? "Dumping" : "Decrypting");
     memset(info, 0, 0x10);
-    for (u32 t_offset = 0; t_offset < size; t_offset += NAND_SECTOR_SIZE * (SECTORS_PER_READ-1)) {
-        u32 read_bytes = min(NAND_SECTOR_SIZE * SECTORS_PER_READ, (size - t_offset));
+    for (u32 t_offset = 0; t_offset < size; t_offset += BUFFER_MAX_SIZE - NAND_SECTOR_SIZE) {
+        u32 read_bytes = min(BUFFER_MAX_SIZE, (size - t_offset));
         ShowProgress(t_offset, size);
-        DecryptNandToMem(buffer, offset + t_offset, read_bytes, ctrnand_info);
+        if (DecryptNandToMem(buffer, offset + t_offset, read_bytes, ctrnand_info) != 0)
+            return 1;
         for (u32 i = 0; i < read_bytes - NAND_SECTOR_SIZE; i++) {
             if(memcmp(buffer + i, (u8*) "Root-CA00000003-XS0000000c", 26) == 0) {
                 u32 exid;
+                u32 consoleId = getle32(buffer + i + 0x98);
                 u8* titleId = buffer + i + 0x9C;
                 u32 commonKeyIndex = *(buffer + i + 0xB1);
                 u8* titlekey = buffer + i + 0x7F;
                 for (exid = 0; exid < nKeys; exid++)
                     if (memcmp(titleId, info->entries[exid].titleId, 8) == 0)
                         break;
-                if (exid < nKeys)
-                    continue; // continue if already dumped
+                if (!consoleId || (exid < nKeys)) {
+                    nSkipped++;
+                    continue; // skip useless / duplicates
+                }
                 memset(&(info->entries[nKeys]), 0, sizeof(TitleKeyEntry));
                 memcpy(info->entries[nKeys].titleId, titleId, 8);
-                memcpy(info->entries[nKeys].encryptedTitleKey, titlekey, 16);
+                memcpy(info->entries[nKeys].titleKey, titlekey, 16);
                 info->entries[nKeys].commonKeyIndex = commonKeyIndex;
-                DecryptTitlekey(&(info->entries[nKeys]));
+                if (!(param & TK_ENCRYPTED))
+                    CryptTitlekey(&(info->entries[nKeys]), false);
                 nKeys++;
             }
         }
@@ -121,10 +136,14 @@ u32 DecryptTitlekeysNand(u32 param)
     info->n_entries = nKeys;
     ShowProgress(0, 0);
     
-    Debug("Decrypted %u unique Title Keys", nKeys);
+    Debug("Decrypted %u unique Titlekeys", nKeys);
+    Debug("Skipped %u useless Titlekeys", nSkipped);
+    
+    if (OutputFileNameSelector(filename, (param & TK_ENCRYPTED) ? "encTitleKeys.bin" : "decTitleKeys.bin", NULL) != 0)
+        return 1;
     
     if(nKeys > 0) {
-        if (!DebugFileCreate((param & N_EMUNAND) ? "decTitleKeys_emu.bin" : "decTitleKeys.bin", true))
+        if (!DebugFileCreate(filename, true))
             return 1;
         if (!DebugFileWrite(info, 0x10 + nKeys * 0x20, 0)) {
             FileClose();

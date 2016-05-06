@@ -3,7 +3,7 @@
 #include "common.h"
 
 #define BUFFER_ADDRESS  ((u8*) 0x21000000)
-#define BUFFER_MAX_SIZE (1 * 1024 * 1024) // must be a multiple of 0x40 (64)
+#define BUFFER_MAX_SIZE ((u32) (1 * 1024 * 1024)) // must be a multiple of 0x200 (512)
 
 typedef struct {
     u32  keyslot;

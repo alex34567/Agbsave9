@@ -16,6 +16,7 @@
 #define F_SEEDSAVE    (1<<8)
 #define F_NAGSAVE     (1<<9)
 #define F_NNIDSAVE    (1<<10)
+#define F_FRIENDSAVE  (1<<11)
 
 typedef struct {
     char name[32];
@@ -40,3 +41,4 @@ u32 DumpFile(u32 param);
 u32 InjectFile(u32 param);
 u32 DumpHealthAndSafety(u32 param);
 u32 InjectHealthAndSafety(u32 param);
+u32 UpdateSeedDb(u32 param);

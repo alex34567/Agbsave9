@@ -19,13 +19,9 @@
 #define vu64 volatile u64
 
 #define max(a,b) \
-    ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-       _a > _b ? _a : _b; })
+    (((a) > (b)) ? (a) : (b))
 #define min(a,b) \
-    ({ __typeof__ (a) _a = (a); \
-       __typeof__ (b) _b = (b); \
-       _a < _b ? _a : _b; })
+    (((a) < (b)) ? (a) : (b))
 #define getbe16(d) \
     (((d)[0]<<8) | (d)[1])
 #define getbe32(d) \
@@ -43,7 +39,10 @@
 #define WORK_DIR "/Agbsave9"
 #define LOG_FILE "Agbsave9.log"
 
-inline u32 strchrcount(const char* str, char symbol) {
+// if defined, assume a panda unit
+// #define PANDA_WORKAROUND
+
+static inline u32 strchrcount(const char* str, char symbol) {
     u32 count = 0;
     for (u32 i = 0; str[i] != '\0'; i++) {
         if (str[i] == symbol)

@@ -9,6 +9,8 @@
 #define GC_NCCH_ENCRYPT (1<<3)
 #define GC_CIA_ENCRYPT  (1<<4)
 #define GC_CXI_ONLY     (1<<5)
+#define GC_BOSS_PROCESS (1<<6)
+#define GC_BOSS_ENCRYPT (1<<7) 
 
 #define MAX_ENTRIES 1024
 
@@ -40,8 +42,8 @@ typedef struct {
     u8   keyY[16];
     u32  size_mb;
     u8   reserved[4];
-    u32  usesSeedCrypto;
-    u32  uses7xCrypto;
+    u32  ncchFlag7;
+    u32  ncchFlag3;
     u64  titleId;
     char filename[112];
 } __attribute__((packed)) NcchInfoEntry;
@@ -88,20 +90,20 @@ typedef struct {
 
 
 u32 GetSdCtr(u8* ctr, const char* path);
-u32 GetSd0x34KeyY(u8* movable_keyY, bool from_nand);
+u32 GetNcchCtr(u8* ctr, NcchHeader* ncch, u8 sub_id);
 u32 SdFolderSelector(char* path, u8* keyY);
 u32 SdInfoGen(SdInfo* info, const char* base_path);
-u32 CryptSdToSd(const char* filename, u32 offset, u32 size, CryptBufferInfo* info);
+u32 CryptSdToSd(const char* filename, u32 offset, u32 size, CryptBufferInfo* info, bool handle_offset16);
 u32 GetHashFromFile(const char* filename, u32 offset, u32 size, u8* hash);
-u32 CheckHashFromFile(const char* filename, u32 offset, u32 size, u8* hash);
+u32 CheckHashFromFile(const char* filename, u32 offset, u32 size, const u8* hash);
 u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encrypt_flags);
 u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_only);
+u32 CryptBoss(const char* filename, bool encrypt);
 
 // --> FEATURE FUNCTIONS <--
 u32 NcchPadgen(u32 param);
 u32 SdPadgen(u32 param);
 u32 SdPadgenDirect(u32 param);
-u32 UpdateSeedDb(u32 param);
 u32 CryptGameFiles(u32 param);
 u32 CryptSdFiles(u32 param);
 u32 DecryptSdFilesDirect(u32 param);

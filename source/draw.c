@@ -63,13 +63,13 @@ void DrawCharacter(u8* screen, int character, int x, int y, int color, int bgcol
 
 void DrawString(u8* screen, const char *str, int x, int y, int color, int bgcolor)
 {
-    for (int i = 0; i < strlen(str); i++)
+    for (size_t i = 0; i < strlen(str); i++)
         DrawCharacter(screen, str[i], x + i * 8, y, color, bgcolor);
 }
 
 void DrawStringF(int x, int y, bool use_top, const char *format, ...)
 {
-    char str[512] = {}; // 512 should be more than enough
+    char str[512] = { 0 }; // 512 should be more than enough
     va_list va;
 
     va_start(va, format);
@@ -97,9 +97,9 @@ void Screenshot(const char* path)
         0x00, 0x00, 0x00, 0xCA, 0x08, 0x00, 0x12, 0x0B, 0x00, 0x00, 0x12, 0x0B, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00
     };
-    static u32 n = 0;
     
     if (path == NULL) {
+        static u32 n = 0;
         for (; n < 1000; n++) {
             char filename[16];
             snprintf(filename, 16, "snap%03i.bmp", (int) n);
@@ -136,6 +136,7 @@ void DebugClear()
     LoadThemeGfx(GFX_DEBUG_BG, true);
     #endif
     LogWrite("");
+    LogWrite(NULL);
 }
 
 void DebugSet(const char **strs)
@@ -182,6 +183,7 @@ void Debug(const char *format, ...)
     DebugSet(NULL);
 }
 
+#if !defined(USE_THEME) || !defined(ALT_PROGRESS)
 void ShowProgress(u64 current, u64 total)
 {
     const u32 progX = SCREEN_WIDTH_TOP - 40;
@@ -197,3 +199,4 @@ void ShowProgress(u64 current, u64 total)
         DrawString(TOP_SCREEN1, "    ", progX, progY, DBG_COLOR_FONT, DBG_COLOR_BG);
     }
 }
+#endif

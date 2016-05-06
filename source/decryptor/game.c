@@ -5,8 +5,7 @@
 #include "decryptor/aes.h"
 #include "decryptor/sha.h"
 #include "decryptor/decryptor.h"
-#include "decryptor/nand.h"
-#include "decryptor/nandfat.h"
+#include "decryptor/keys.h"
 #include "decryptor/titlekey.h"
 #include "decryptor/game.h"
 
@@ -27,44 +26,29 @@ u32 GetSdCtr(u8* ctr, const char* path)
             break;
         }
     }
-    sha_init(SHA256_MODE);
-    sha_update(hashstr, (plen + 1) * 2);
-    sha_get(sha256sum);
+    sha_quick(sha256sum, hashstr, (plen + 1) * 2, SHA256_MODE);
     for (u32 i = 0; i < 16; i++)
         ctr[i] = sha256sum[i] ^ sha256sum[i+16];
     
     return 0;
 }
 
-u32 GetSd0x34KeyY(u8* movable_keyY, bool from_nand)
-{
-    u8 movable_sed[0x200];
-    
-    if (from_nand) { // load console 0x34 keyY from movable.sed from NAND
-        PartitionInfo* p_info = GetPartitionInfo(P_CTRNAND);
-        u32 offset;
-        u32 size;
-        if (DebugSeekFileInNand(&offset, &size, "movable.sed", "PRIVATE    MOVABLE SED", p_info) != 0)
-            return 1;
-        if (size < 0x120) {
-            Debug("movable.sed has bad size!");
-            return 1;
+u32 GetNcchCtr(u8* ctr, NcchHeader* ncch, u8 sub_id) {
+    memset(ctr, 0x00, 16);
+    if (ncch->version == 1) {
+        memcpy(ctr, &(ncch->partitionId), 8);
+        if (sub_id == 1) { // exHeader ctr
+            add_ctr(ctr, 0x200); 
+        } else if (sub_id == 2) { // exeFS ctr
+            add_ctr(ctr, ncch->offset_exefs * 0x200);
+        } else if (sub_id == 3) { // romFS ctr
+            add_ctr(ctr, ncch->offset_romfs * 0x200);
         }
-        DecryptNandToMem(movable_sed, offset, 0x120, p_info);
-    } else if (DebugFileOpen("movable.sed")) { // load console 0x34 keyY from movable.sed from SD card
-        if (!DebugFileRead(movable_sed, 0x120, 0)) {
-            FileClose();
-            return 1;
-        }
-        FileClose();
     } else {
-        return 1;
+        for (u32 i = 0; i < 8; i++)
+            ctr[i] = ((u8*) &(ncch->partitionId))[7-i];
+        ctr[8] = sub_id;
     }
-    if (memcmp(movable_sed, "SEED", 4) != 0) {
-        Debug("movable.sed is corrupt!");
-        return 1;
-    }
-    memcpy(movable_keyY, movable_sed + 0x110, 0x10);
     
     return 0;
 }
@@ -79,9 +63,7 @@ u32 SdFolderSelector(char* path, u8* keyY)
     // see here: https://www.3dbrew.org/wiki/Nand/private/movable.sed
     u32 sha256sum[8];
     char base_path[64];
-    sha_init(SHA256_MODE);
-    sha_update(keyY, 16);
-    sha_get(sha256sum);
+    sha_quick(sha256sum, keyY, 16, SHA256_MODE);
     snprintf(base_path, 63, "/Nintendo 3DS/%08X%08X%08X%08X",
         (unsigned int) sha256sum[0], (unsigned int) sha256sum[1],
         (unsigned int) sha256sum[2], (unsigned int) sha256sum[3]);
@@ -194,21 +176,23 @@ u32 SdInfoGen(SdInfo* info, const char* base_path)
 
 u32 NcchPadgen(u32 param)
 {
+    (void) (param); // param is unused here
     NcchInfo *info = (NcchInfo*)0x20316000;
     SeedInfo *seedinfo = (SeedInfo*)0x20400000;
 
-    if (DebugFileOpen("slot0x25KeyX.bin")) {
-        u8 slot0x25KeyX[16] = {0};
-        if (!DebugFileRead(&slot0x25KeyX, 16, 0)) {
-            FileClose();
-            return 1;
-        }
-        FileClose();
-        setup_aeskeyX(0x25, slot0x25KeyX);
-    } else {
-        Debug("7.x game decryption will fail on less than 7.x");
+    if (CheckKeySlot(0x25, 'X') != 0) {
+        Debug("slot0x25KeyX not set up");
+        Debug("7.x crypto will fail on O3DS < 7.x or A9LH");
     }
-
+    if ((GetUnitPlatform() == PLATFORM_3DS) && (CheckKeySlot(0x18, 'X') != 0)) {
+        Debug("slot0x18KeyX not set up");
+        Debug("Secure3 crypto will fail");
+    }
+    if (CheckKeySlot(0x1B, 'X') != 0) {
+        Debug("slot0x1BKeyX not set up");
+        Debug("Secure4 crypto will fail");
+    }
+       
     if (DebugFileOpen("seeddb.bin")) {
         if (!DebugFileRead(seedinfo, 16, 0)) {
             FileClose();
@@ -225,7 +209,7 @@ u32 NcchPadgen(u32 param)
         }
         FileClose();
     } else {
-        Debug("9.x seed crypto game decryption will fail");
+        Debug("9.x seed crypto will fail");
     }
 
     if (!DebugFileOpen("ncchinfo.bin"))
@@ -280,7 +264,11 @@ u32 NcchPadgen(u32 param)
         memcpy(padInfo.filename, info->entries[i].filename, 112);
         Debug ("%2i: %s (%iMB)", i, info->entries[i].filename, info->entries[i].size_mb);
         
-        if (info->entries[i].usesSeedCrypto) {
+        // workaround to still be able to process old ncchinfo.bin
+        if ((info->entries[i].ncchFlag7 == 0x01) && info->entries[i].ncchFlag3)
+            info->entries[i].ncchFlag7 = 0x20; // this combination means seed crypto rather than FixedKey
+        
+        if (info->entries[i].ncchFlag7 & 0x20) { // seed crypto
             u8 keydata[32];
             memcpy(keydata, info->entries[i].keyY, 16);
             u32 found_seed = 0;
@@ -291,35 +279,35 @@ u32 NcchPadgen(u32 param)
                     break;
                 }
             }
-            if (!found_seed)
-            {
+            if (!found_seed) {
                 Debug("Failed to find seed in seeddb.bin");
                 return 1;
             }
             u8 sha256sum[32];
-            sha_init(SHA256_MODE);
-            sha_update(keydata, 32);
-            sha_get(sha256sum);
+            sha_quick(sha256sum, keydata, 32, SHA256_MODE);
             memcpy(padInfo.keyY, sha256sum, 16);
         }
-        else
+        else {
             memcpy(padInfo.keyY, info->entries[i].keyY, 16);
-
-        if (info->entries[i].uses7xCrypto == 0xA) { 
-            if (GetUnitPlatform() == PLATFORM_3DS) { // won't work on an Old 3DS
-                Debug("This can only be generated on N3DS");
-                return 1;
-            }
-            padInfo.keyslot = 0x18;
-        } else if (info->entries[i].uses7xCrypto == 0xB) {
-            Debug("Secure4 xorpad cannot be generated yet");
-            return 1;
-        } else if(info->entries[i].uses7xCrypto >> 8 == 0xDEC0DE) // magic value to manually specify keyslot
-            padInfo.keyslot = info->entries[i].uses7xCrypto & 0x3F;
-        else if (info->entries[i].uses7xCrypto)
-            padInfo.keyslot = 0x25;
-        else
-            padInfo.keyslot = 0x2C;
+        }
+        
+        if (info->entries[i].ncchFlag7 == 0x01) {
+            u8 zeroKey[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+            u8 sysKey[16]  = {0x52, 0x7C, 0xE6, 0x30, 0xA9, 0xCA, 0x30, 0x5F, 0x36, 0x96, 0xF3, 0xCD, 0xE9, 0x54, 0x19, 0x4B};
+            setup_aeskey(0x11, (info->entries[i].titleId & ((u64) 0x10 << 32)) ? sysKey : zeroKey);
+            padInfo.setKeyY = 0;
+            padInfo.keyslot = 0x11; // fixedKey crypto
+        } else if (info->entries[i].ncchFlag3 == 0x0A) {
+            padInfo.keyslot = 0x18; // Secure3 crypto, needs slot0x18KeyX.bin on O3DS
+        } else if (info->entries[i].ncchFlag3 == 0x0B) {
+            padInfo.keyslot = 0x1B; // Secure4 crypto, needs slot0x1BKeyX.bin
+        } else if(info->entries[i].ncchFlag3 >> 8 == 0xDEC0DE) { // magic value to manually specify keyslot
+            padInfo.keyslot = info->entries[i].ncchFlag3 & 0x3F;
+        } else if (info->entries[i].ncchFlag3) {
+            padInfo.keyslot = 0x25; // 7.x crypto
+        } else {
+            padInfo.keyslot = 0x2C; // standard crypto
+        }
         Debug("Using keyslot: %02X", padInfo.keyslot);
         
         if (CreatePad(&padInfo) != 0)
@@ -331,14 +319,11 @@ u32 NcchPadgen(u32 param)
 
 u32 SdPadgen(u32 param)
 {
+    (void) (param); // param is unused here
     SdInfo *info = (SdInfo*) 0x20316000;
-    u8 movable_keyY[16];
 
-    if (GetSd0x34KeyY(movable_keyY, false) == 0) {
-        Debug("Setting console 0x34 keyY");
-        setup_aeskeyY(0x34, movable_keyY);
-        use_aeskey(0x34);
-    }
+    // setup AES key from SD
+    SetupSd0x34KeyY(false, NULL);
     
     if (!DebugFileOpen("SDinfo.bin"))
         return 1;
@@ -372,17 +357,13 @@ u32 SdPadgen(u32 param)
 
 u32 SdPadgenDirect(u32 param)
 {
+    (void) (param); // param is unused here
     SdInfo *info = (SdInfo*) 0x20316000;
     char basepath[256];
     u8 movable_keyY[16];
     
-    if (GetSd0x34KeyY(movable_keyY, true) == 0) {
-        Debug("Setting console 0x34 keyY");
-        setup_aeskeyY(0x34, movable_keyY);
-        use_aeskey(0x34);
-    } else {
+    if (SetupSd0x34KeyY(true, movable_keyY) != 0)
         return 1; // movable.sed has to be present in NAND
-    }
     
     Debug("");
     if (SdFolderSelector(basepath, movable_keyY) != 0)
@@ -408,99 +389,10 @@ u32 SdPadgenDirect(u32 param)
     return 0;
 }
 
-u32 UpdateSeedDb(u32 param)
-{
-    PartitionInfo* ctrnand_info = GetPartitionInfo(P_CTRNAND);
-    u8* buffer = BUFFER_ADDRESS;
-    SeedInfo *seedinfo = (SeedInfo*) 0x20400000;
-    
-    u32 nNewSeeds = 0;
-    u32 offset;
-    u32 size;
-    
-    // load full seedsave to memory
-    Debug("Searching for seedsave...");
-    if (SeekFileInNand(&offset, &size, "DATA       ???????????SYSDATA    0001000F   00000000   ", ctrnand_info) != 0) {
-        Debug("Failed!");
-        return 1;
-    }
-    Debug("Found at %08X, size %ukB", offset, size / 1024);
-    if (size != 0xAC000) {
-        Debug("Expected %ukB, failed!", 0xAC000);
-        return 1;
-    }
-    DecryptNandToMem(buffer, offset, size, ctrnand_info);
-    
-    // load / create seeddb.bin
-    if (DebugFileOpen("seeddb.bin")) {
-        if (!DebugFileRead(seedinfo, 16, 0)) {
-            FileClose();
-            return 1;
-        }
-        if (seedinfo->n_entries > MAX_ENTRIES) {
-            Debug("seeddb.bin seems to be corrupt!");
-            FileClose();
-            return 1;
-        }
-        if (!DebugFileRead(seedinfo->entries, seedinfo->n_entries * sizeof(SeedInfoEntry), 16)) {
-            FileClose();
-            return 1;
-        }
-    } else {
-        if (!DebugFileCreate("seeddb.bin", true))
-            return 1;
-        memset(seedinfo, 0x00, 16);
-    }
-    
-    // search and extract seeds
-    for ( int n = 0; n < 2; n++ ) {
-        // there are two offsets where seeds can be found - 0x07000 & 0x5C000
-        u8* seed_data = buffer + ((n == 0) ? 0x7000 : 0x5C000);
-        for ( size_t i = 0; i < 2000; i++ ) { 
-            // magic number is the reversed first 4 byte of a title id
-            static const u8 magic[4] = { 0x00, 0x00, 0x04, 0x00 };
-            // 2000 seed entries max, splitted into title id and seed area
-            u8* titleId = seed_data + (i*8);
-            u8* seed = seed_data + (2000*8) + (i*16);
-            if (memcmp(titleId + 4, magic, 4) != 0)
-                continue;
-            // seed found, check if it already exists
-            u32 entryPos = 0;
-            for (entryPos = 0; entryPos < seedinfo->n_entries; entryPos++)
-                if (memcmp(titleId, &(seedinfo->entries[entryPos].titleId), 8) == 0)
-                    break;
-            if (entryPos < seedinfo->n_entries) {
-                Debug("Found %08X%08X seed (duplicate)", getle32(titleId + 4), getle32(titleId));
-                continue;
-            }
-            // seed is new, create a new entry
-            Debug("Found %08X%08X seed (new)", getle32(titleId + 4), getle32(titleId));
-            memset(&(seedinfo->entries[entryPos]), 0x00, sizeof(SeedInfoEntry));
-            memcpy(&(seedinfo->entries[entryPos].titleId), titleId, 8);
-            memcpy(&(seedinfo->entries[entryPos].external_seed), seed, 16);
-            seedinfo->n_entries++;
-            nNewSeeds++;
-        }
-    }
-    
-    if (nNewSeeds == 0) {
-        Debug("Found no new seeds, %i total", seedinfo->n_entries);
-        FileClose();
-        return 0;
-    }
-    
-    Debug("Found %i new seeds, %i total", nNewSeeds, seedinfo->n_entries);
-    if (!DebugFileWrite(seedinfo, 16 + seedinfo->n_entries * sizeof(SeedInfoEntry), 0))
-        return 1;
-    FileClose();
-    
-    return 0;
-}
-
-u32 CryptSdToSd(const char* filename, u32 offset, u32 size, CryptBufferInfo* info)
+u32 CryptSdToSd(const char* filename, u32 offset, u32 size, CryptBufferInfo* info, bool handle_offset16)
 {
     u8* buffer = BUFFER_ADDRESS;
-    u32 offset_16 = offset % 16;
+    u32 offset_16 = (handle_offset16) ? offset % 16 : 0;
     u32 result = 0;
 
     // no DebugFileOpen() - at this point the file has already been checked enough
@@ -563,7 +455,7 @@ u32 GetHashFromFile(const char* filename, u32 offset, u32 size, u8* hash)
     return 0;
 }
 
-u32 CheckHashFromFile(const char* filename, u32 offset, u32 size, u8* hash)
+u32 CheckHashFromFile(const char* filename, u32 offset, u32 size, const u8* hash)
 {
     u8 digest[32];
     
@@ -582,13 +474,8 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
     u8 seedKeyY[16] = { 0x00 };
     u32 result = 0;
     
-    if (!FileOpen(filename)) // already checked this file
-        return 1;
-    if (!DebugFileRead((void*) ncch, 0x200, offset)) {
-        FileClose();
-        return 1;
-    }
-    FileClose();
+    if (FileGetData(filename, (void*) ncch, 0x200, offset) != 0x200)
+        return 1; // it's impossible to fail here anyways
  
     // check (again) for magic number
     if (memcmp(ncch->magic, "NCCH", 4) != 0) {
@@ -623,7 +510,7 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
     }
     
     // select correct title ID for seed crypto
-    if (seedId == 0) seedId = ncch->partitionId;
+    if (seedId == 0) seedId = ncch->programId;
     
     // copy over encryption parameters (if applicable)
     if (encrypt_flags) {
@@ -639,7 +526,7 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
     bool usesSec4Crypto = (ncch->flags[3] == 0x0B);
     bool usesFixedKey = ncch->flags[7] & 0x01;
     
-    Debug("Code / Crypto: %s / %s%s%s%s", ncch->productCode, (usesFixedKey) ? "FixedKey " : "", (usesSec4Crypto) ? "Secure4 " : (usesSec3Crypto) ? "Secure3 " : (uses7xCrypto) ? "7x " : "", (usesSeedCrypto) ? "Seed " : "", (!uses7xCrypto && !usesSeedCrypto && !usesFixedKey) ? "Standard" : "");
+    Debug("Code / Crypto: %.16s / %s%s%s%s", ncch->productCode, (usesFixedKey) ? "FixedKey " : "", (usesSec4Crypto) ? "Secure4 " : (usesSec3Crypto) ? "Secure3 " : (uses7xCrypto) ? "7x " : "", (usesSeedCrypto) ? "Seed " : "", (!uses7xCrypto && !usesSeedCrypto && !usesFixedKey) ? "Standard" : "");
     
     // setup zero key crypto
     if (usesFixedKey) {
@@ -655,30 +542,25 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
         setup_aeskey(0x11, (ncch->programId & ((u64) 0x10 << 32)) ? sysKey : zeroKey);
     }
     
-    // check secure4 crypto
-    if (usesSec4Crypto) {
-        Debug("Secure4 crypto is not supported!");
+    // check 7x crypto
+    if (uses7xCrypto && (CheckKeySlot(0x25, 'X') != 0)) {
+        Debug("slot0x25KeyX not set up");
+        Debug("This won't work on O3DS < 7.x or A9LH");
         return 1;
     }
     
-    // check / setup 7x crypto
-    if (uses7xCrypto && (GetUnitPlatform() == PLATFORM_3DS)) {
-        if (usesSec3Crypto) {
-            Debug("Secure3 crypto needs a N3DS!");
-            return 1;
-        }
-        if (FileOpen("slot0x25KeyX.bin")) {
-            u8 slot0x25KeyX[16] = {0};
-            if (FileRead(&slot0x25KeyX, 16, 0) != 16) {
-                Debug("slot0x25keyX.bin is corrupt!");
-                FileClose();
-                return 1;
-            }
-            FileClose();
-            setup_aeskeyX(0x25, slot0x25KeyX);
-        } else {
-            Debug("Warning: Need slot0x25KeyX.bin on O3DS < 7.x");
-        }
+    // check Secure3 crypto on O3DS
+    if (usesSec3Crypto && (CheckKeySlot(0x18, 'X') != 0)) {
+        Debug("slot0x18KeyX not set up");
+        Debug("Secure3 crypto is not available");
+        return 1;
+    }
+    
+    // check Secure4 crypto
+    if (usesSec4Crypto && (CheckKeySlot(0x1B, 'X') != 0)) {
+        Debug("slot0x1BKeyX not set up");
+        Debug("Secure4 crypto is not available");
+        return 1;
     }
     
     // check / setup seed crypto
@@ -694,9 +576,7 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
                     memcpy(keydata, ncch->signature, 16);
                     memcpy(keydata + 16, entry->external_seed, 16);
                     u8 sha256sum[32];
-                    sha_init(SHA256_MODE);
-                    sha_update(keydata, 32);
-                    sha_get(sha256sum);
+                    sha_quick(sha256sum, keydata, 32, SHA256_MODE);
                     memcpy(seedKeyY, sha256sum, 16);
                     found = 1;
                 }
@@ -710,20 +590,13 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
             Debug("Need seeddb.bin for seed crypto!");
             return 1;
         }
+        Debug("Loading seed from seeddb.bin: ok");
     }
     
     // basic setup of CryptBufferInfo structs
-    memset(info0.ctr, 0x00, 16);
-    if (ncch->version == 1) {
-        memcpy(info0.ctr, &(ncch->partitionId), 8);
-    } else {
-        for (u32 i = 0; i < 8; i++)
-            info0.ctr[i] = ((u8*) &(ncch->partitionId))[7-i];
-    }
-    memcpy(info1.ctr, info0.ctr, 8);
     memcpy(info0.keyY, ncch->signature, 16);
     memcpy(info1.keyY, (usesSeedCrypto) ? seedKeyY : ncch->signature, 16);
-    info1.keyslot = (usesSec3Crypto) ? 0x18 : ((uses7xCrypto) ? 0x25 : 0x2C);
+    info1.keyslot = (usesSec4Crypto) ? 0x1B : ((usesSec3Crypto) ? 0x18 : ((uses7xCrypto) ? 0x25 : info0.keyslot));
     
     Debug("%s ExHdr/ExeFS/RomFS (%ukB/%ukB/%uMB)",
         (encrypt_flags) ? "Encrypt" : "Decrypt",
@@ -733,74 +606,54 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
         
     // process ExHeader
     if (ncch->size_exthdr > 0) {
-        memset(info0.ctr + 12, 0x00, 4);
-        if (ncch->version == 1)
-            add_ctr(info0.ctr, 0x200); // exHeader offset
-        else
-            info0.ctr[8] = 1;
-        result |= CryptSdToSd(filename, offset + 0x200, 0x800, &info0);
+        GetNcchCtr(info0.ctr, ncch, 1);
+        result |= CryptSdToSd(filename, offset + 0x200, 0x800, &info0, true);
     }
     
     // process ExeFS
     if (ncch->size_exefs > 0) {
         u32 offset_byte = ncch->offset_exefs * 0x200;
         u32 size_byte = ncch->size_exefs * 0x200;
-        memset(info0.ctr + 12, 0x00, 4);
-        if (ncch->version == 1)
-            add_ctr(info0.ctr, offset_byte);
-        else
-            info0.ctr[8] = 2;
         if (uses7xCrypto || usesSeedCrypto) {
-            u32 offset_code = 0;
-            u32 size_code = 0;
-            // find .code offset and size
+            GetNcchCtr(info0.ctr, ncch, 2);
             if (!encrypt_flags) // decrypt this first (when decrypting)
-                result |= CryptSdToSd(filename, offset + offset_byte, 0x200, &info0);
-            if(!FileOpen(filename))
+                result |= CryptSdToSd(filename, offset + offset_byte, 0x200, &info0, true);
+            if (FileGetData(filename, buffer, 0x200, offset + offset_byte) != 0x200) // get exeFS header
                 return 1;
-            if(!DebugFileRead(buffer, 0x200, offset + offset_byte)) {
-                FileClose();
-                return 1;
-            }
-            FileClose();
-            for (u32 i = 0; i < 10; i++) {
-                if(memcmp(buffer + (i*0x10), ".code", 5) == 0) {
-                    offset_code = getle32(buffer + (i*0x10) + 0x8) + 0x200;
-                    size_code = getle32(buffer + (i*0x10) + 0xC);
-                    break;
-                }
-            }
             if (encrypt_flags) // encrypt this last (when encrypting)
-                result |= CryptSdToSd(filename, offset + offset_byte, 0x200, &info0);
-            // special ExeFS decryption routine (only .code has new encryption)
-            if (size_code > 0) {
-                result |= CryptSdToSd(filename, offset + offset_byte + 0x200, offset_code - 0x200, &info0);
-                memcpy(info1.ctr, info0.ctr, 16); // this depends on the exeFS file offsets being aligned (which they are)
-                add_ctr(info0.ctr, size_code / 0x10);
-                info0.setKeyY = info1.setKeyY = 1;
-                result |= CryptSdToSd(filename, offset + offset_byte + offset_code, size_code, &info1);
-                result |= CryptSdToSd(filename,
-                    offset + offset_byte + offset_code + size_code,
-                    size_byte - (offset_code + size_code), &info0);
-            } else {
-                result |= CryptSdToSd(filename, offset + offset_byte + 0x200, size_byte - 0x200, &info0);
+                result |= CryptSdToSd(filename, offset + offset_byte, 0x200, &info0, true);
+            // special ExeFS decryption routine ("banner" and "icon" use standard crypto)
+            for (u32 i = 0; i < 10; i++) {
+                char* name_exefs_file = (char*) buffer + (i*0x10);
+                u32 offset_exefs_file = getle32(buffer + (i*0x10) + 0x8) + 0x200;
+                u32 size_exefs_file = getle32(buffer + (i*0x10) + 0xC);
+                CryptBufferInfo* infoExeFs = ((strncmp(name_exefs_file, "banner", 8) == 0) ||
+                    (strncmp(name_exefs_file, "icon", 8) == 0)) ? &info0 : &info1;
+                if (size_exefs_file == 0)
+                    continue;
+                if (offset_exefs_file % 16) {
+                    Debug("ExeFS file offset not aligned!");
+                    result |= 1;
+                    break; // this should not happen
+                }
+                GetNcchCtr(infoExeFs->ctr, ncch, 2);
+                add_ctr(infoExeFs->ctr, offset_exefs_file / 0x10);
+                infoExeFs->setKeyY = 1;
+                result |= CryptSdToSd(filename, offset + offset_byte + offset_exefs_file,
+                    align(size_exefs_file, 16), infoExeFs, true);
             }
         } else {
-            result |= CryptSdToSd(filename, offset + offset_byte, size_byte, &info0);
+            GetNcchCtr(info0.ctr, ncch, 2);
+            result |= CryptSdToSd(filename, offset + offset_byte, size_byte, &info0, true);
         }
     }
     
     // process RomFS
     if (ncch->size_romfs > 0) {
-        u32 offset_byte = ncch->offset_romfs * 0x200;
-        u32 size_byte = ncch->size_romfs * 0x200;
-        memset(info1.ctr + 12, 0x00, 4);
-        if (ncch->version == 1)
-            add_ctr(info1.ctr, offset_byte);
-        else
-            info1.ctr[8] = 3;
-        info1.setKeyY = 1;
-        result |= CryptSdToSd(filename, offset + offset_byte, size_byte, &info1);
+        GetNcchCtr(info1.ctr, ncch, 3);
+        if (!usesFixedKey)
+            info1.setKeyY = 1;
+        result |= CryptSdToSd(filename, offset + (ncch->offset_romfs * 0x200), ncch->size_romfs * 0x200, &info1, true);
     }
     
     // set NCCH header flags
@@ -832,6 +685,20 @@ u32 CryptNcch(const char* filename, u32 offset, u32 size, u64 seedId, u8* encryp
             ver_exefs = CheckHashFromFile(filename, offset + (ncch->offset_exefs * 0x200), ncch->size_exefs_hash * 0x200, ncch->hash_exefs);
         if (ncch->size_romfs_hash > 0)
             ver_romfs = CheckHashFromFile(filename, offset + (ncch->offset_romfs * 0x200), ncch->size_romfs_hash * 0x200, ncch->hash_romfs);
+        
+        if (ncch->size_exefs > 0) { // thorough exefs verification
+            u32 offset_byte = ncch->offset_exefs * 0x200;
+            if (FileGetData(filename, buffer, 0x200, offset + offset_byte) != 0x200)
+                ver_exefs = 1;
+            for (u32 i = 0; (i < 10) && (ver_exefs != 1); i++) {
+                u32 offset_exefs_file = offset_byte + getle32(buffer + (i*0x10) + 0x8) + 0x200;
+                u32 size_exefs_file = getle32(buffer + (i*0x10) + 0xC);
+                u8* hash_exefs_file = buffer + 0x200 - ((i+1)*0x20);
+                if (size_exefs_file == 0)
+                    break;
+                ver_exefs = CheckHashFromFile(filename, offset + offset_exefs_file, size_exefs_file, hash_exefs_file);
+            }
+        }
         
         Debug("Verify ExHdr/ExeFS/RomFS: %s/%s/%s", status_str[ver_exthdr], status_str[ver_exefs], status_str[ver_romfs]);
         result = (((ver_exthdr | ver_exefs | ver_romfs) & 1) == 0) ? 0 : 1;
@@ -929,10 +796,10 @@ u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_on
     TitleKeyEntry titlekeyEntry;
     titleId = getbe64(ticket_data + 0x9C);
     memcpy(titlekeyEntry.titleId, ticket_data + 0x9C, 8);
-    memcpy(titlekeyEntry.encryptedTitleKey, ticket_data + 0x7F, 16);
+    memcpy(titlekeyEntry.titleKey, ticket_data + 0x7F, 16);
     titlekeyEntry.commonKeyIndex = *(ticket_data + 0xB1);
-    DecryptTitlekey(&titlekeyEntry);
-    memcpy(titlekey, titlekeyEntry.encryptedTitleKey, 16);
+    CryptTitlekey(&titlekeyEntry, false);
+    memcpy(titlekey, titlekeyEntry.titleKey, 16);
     
     // get content data from TMD
     content_count = getbe16(tmd_data + 0x9E);
@@ -977,7 +844,7 @@ u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_on
         Debug("%scrypting Content %i of %i (%iMB)...", (cia_encrypt) ? "En" : "De", i + 1, content_count, size / (1024*1024));
         memset(info.ctr, 0x00, 16);
         memcpy(info.ctr, content_list + (0x30 * i) + 4, 2);
-        if (CryptSdToSd(filename, offset, size, &info) != 0) {
+        if (CryptSdToSd(filename, offset, size, &info, true) != 0) {
             Debug("%scryption failed!", (cia_encrypt) ? "En" : "De");
             result = 1;
             continue;
@@ -1003,6 +870,8 @@ u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_on
             u32 size = getbe32(content_list + (0x30 * i) + 0xC);
             u32 offset = next_offset;
             next_offset = offset + size;
+            if (content_list[(0x30 * i) + 0x7] & 0x1)
+                continue; // skip this if still CIA (shallow) encrypted
             Debug("Processing Content %i of %i (%iMB)...", i + 1, content_count, size / (1024*1024));
             ncch_state = CryptNcch(filename, offset, size, titleId, NULL);
             if (!(ncch_crypt[7] & 0x04) && (ncch_state != 1))
@@ -1028,16 +897,12 @@ u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_on
             for (u32 i = 0, kc = 0; i < 64 && kc < content_count; i++) {
                 u32 k = getbe16(tmd_data + 0xC4 + (i * 0x24) + 0x02);
                 u8 chunk_hash[32];
-                sha_init(SHA256_MODE);
-                sha_update(content_list + kc * 0x30, k * 0x30);
-                sha_get(chunk_hash);
+                sha_quick(chunk_hash, content_list + kc * 0x30, k * 0x30, SHA256_MODE);
                 memcpy(tmd_data + 0xC4 + (i * 0x24) + 0x04, chunk_hash, 32);
                 kc += k;
             }
             u8 tmd_hash[32];
-            sha_init(SHA256_MODE);
-            sha_update(tmd_data + 0xC4, 64 * 0x24);
-            sha_get(tmd_hash);
+            sha_quick(tmd_hash, tmd_data + 0xC4, 64 * 0x24, SHA256_MODE);
             memcpy(tmd_data + 0xA4, tmd_hash, 32);
         }
     }
@@ -1055,11 +920,84 @@ u32 CryptCia(const char* filename, u8* ncch_crypt, bool cia_encrypt, bool cxi_on
     return result;
 }
 
+u32 CryptBoss(const char* filename, bool encrypt)
+{
+    const u8 boss_magic[] = {0x62, 0x6F, 0x73, 0x73, 0x00, 0x01, 0x00, 0x01};
+    CryptBufferInfo info = {.setKeyY = 0, .keyslot = 0x38, .mode = AES_CNT_CTRNAND_MODE};
+    u8 boss_header[0x28];
+    u8 content_header[0x14] = { 0x00 };
+    u8 content_header_sha256[0x20];
+    u8 l_sha256[0x20];
+    u32 fsize = 0;
+    bool encrypted = true;
+    
+    // base BOSS file checks
+    if (!FileOpen(filename)) // already checked this file
+        return 1;
+    if (!DebugFileRead(boss_header, 0x28, 0x00)) {
+        FileClose();
+        return 1;
+    }
+    if (memcmp(boss_magic, boss_header, 8) != 0) {
+        Debug("Not a BOSS file");
+        FileClose();
+        return 1;
+    }
+    fsize = getbe32(boss_header + 8);
+    if ((fsize != FileGetSize()) || (fsize < 0x52)) {
+        Debug("BOSS file has bad size");
+        FileClose();
+        return 1;
+    }
+    FileClose();
+
+    // BOSS file verification / encryption check
+    if (FileGetData(filename, content_header, 0x12, 0x28) != 0x12)
+        return 1;
+    if (FileGetData(filename, content_header_sha256, 0x20, 0x3A) != 0x20)
+        return 1;
+    sha_quick(l_sha256, content_header, 0x14, SHA256_MODE);
+    encrypted = (memcmp(content_header_sha256, l_sha256, 0x20) != 0);
+    if (encrypt == encrypted) {
+        Debug("BOSS is already %scrypted", (encrypted) ? "en" : "de");
+        return 1;
+    }
+    
+    if (!encrypted) {
+        Debug("BOSS verification: OK");
+    }
+    
+    // BOSS file decryption
+    Debug("%scrypting BOSS...", (encrypt) ? "En" : "De");
+    memset(info.ctr, 0x00, 16);
+    memcpy(info.ctr, boss_header + 0x1C, 12);
+    info.ctr[15] = 0x01;
+    Debug("CTR: %08X%08X%08X%08X", getbe32(info.ctr), getbe32(info.ctr + 4), getbe32(info.ctr + 8), getbe32(info.ctr + 12));
+    CryptSdToSd(filename, 0x28, fsize - 0x28, &info, false);
+    
+    // BOSS file verification (#2)
+    if (!encrypt) {
+        if (FileGetData(filename, content_header, 0x12, 0x28) != 0x12)
+            return 1;
+        if (FileGetData(filename, content_header_sha256, 0x20, 0x3A) != 0x20)
+            return 1;
+        sha_quick(l_sha256, content_header, 0x14, SHA256_MODE);
+        if (memcmp(content_header_sha256, l_sha256, 0x20) == 0) {
+            Debug("BOSS verification: OK");
+        } else {
+            Debug("BOSS verification: Failed");
+            return 1;
+        }
+    }
+    
+    return 0;
+}
 
 u32 CryptGameFiles(u32 param)
 {
     u8 ncch_crypt_none[8]     = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04 };
     u8 ncch_crypt_standard[8] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    const u8 boss_magic[] = {0x62, 0x6F, 0x73, 0x73, 0x00, 0x01, 0x00, 0x01};
     const char* ncsd_partition_name[8] = {
         "Executable", "Manual", "DPC", "Unknown", "Unknown", "Unknown", "UpdateN3DS", "UpdateO3DS" 
     };
@@ -1068,6 +1006,8 @@ u32 CryptGameFiles(u32 param)
     
     bool batch_ncch = param & GC_NCCH_PROCESS;
     bool batch_cia = param & GC_CIA_PROCESS;
+    bool batch_boss = param & GC_BOSS_PROCESS;
+    bool boss_encrypt = param & GC_BOSS_ENCRYPT;
     bool cia_encrypt = param & GC_CIA_ENCRYPT;
     bool cxi_only = param & GC_CXI_ONLY;
     u8* ncch_crypt = (param & GC_NCCH_ENCRYPT) ? ncch_crypt_standard : NULL;
@@ -1090,13 +1030,8 @@ u32 CryptGameFiles(u32 param)
     path[path_len++] = '/';
     
     while (DirRead(path + path_len, 256 - path_len)) {
-        if (!FileOpen(path))
+        if (FileGetData(path, buffer, 0x200, 0x0) != 0x200)
             continue;
-        if (!FileRead(buffer, 0x200, 0x0)) {
-            FileClose();
-            continue;
-        }
-        FileClose();
         
         if (batch_ncch && (memcmp(buffer + 0x100, "NCCH", 4) == 0)) {
             Debug("Processing NCCH \"%s\"", path + path_len);
@@ -1139,6 +1074,15 @@ u32 CryptGameFiles(u32 param)
                 Debug("Failed!");
                 n_failed++;
             }
+        } else if (batch_boss && (memcmp(buffer, boss_magic, 8) == 0)) {
+            Debug("Processing BOSS \"%s\"", path + path_len);
+            if (CryptBoss(path, boss_encrypt) == 0) {
+                Debug("Success!");
+                n_processed++;
+            } else {
+                Debug("Failed!");
+                n_failed++;
+            }
         }
     }
     
@@ -1154,9 +1098,10 @@ u32 CryptGameFiles(u32 param)
     return !n_processed;
 }
 
-u32 CryptSdFiles(u32 param) {
+u32 CryptSdFiles(u32 param)
+{
+    (void) (param); // param is unused here
     const char* subpaths[] = {"dbs", "extdata", "title", NULL};
-    u8 movable_keyY[16] = { 0 };
     char* batch_dir = GAME_DIR;
     u32 n_processed = 0;
     u32 n_failed = 0;
@@ -1172,11 +1117,8 @@ u32 CryptSdFiles(u32 param) {
     DirClose();
     plen = strnlen(batch_dir, 128);
     
-    if (GetSd0x34KeyY(movable_keyY, false) == 0) {
-        Debug("Setting console 0x34 keyY");
-        setup_aeskeyY(0x34, movable_keyY);
-        use_aeskey(0x34);
-    }
+    // setup AES key from SD
+    SetupSd0x34KeyY(false, NULL);
     
     // main processing loop
     for (u32 s = 0; subpaths[s] != NULL; s++) {
@@ -1203,7 +1145,7 @@ u32 CryptSdFiles(u32 param) {
                 continue;
             }
             Debug("%2u: %s", n_processed, path + bplen);
-            if (CryptSdToSd(path, 0, fsize, &info) == 0) {
+            if (CryptSdToSd(path, 0, fsize, &info, true) == 0) {
                 n_processed++;
             } else {
                 Debug("Failed!");
@@ -1215,7 +1157,9 @@ u32 CryptSdFiles(u32 param) {
     return (n_processed) ? 0 : 1;
 }
 
-u32 DecryptSdFilesDirect(u32 param) {
+u32 DecryptSdFilesDirect(u32 param)
+{
+    (void) (param); // param is unused here
     char* filelist = (char*) 0x20400000;
     u8 movable_keyY[16] = { 0 };
     char basepath[256];
@@ -1233,13 +1177,8 @@ u32 DecryptSdFilesDirect(u32 param) {
     }
     DirClose();
     
-    if (GetSd0x34KeyY(movable_keyY, true) == 0) {
-        Debug("Setting console 0x34 keyY");
-        setup_aeskeyY(0x34, movable_keyY);
-        use_aeskey(0x34);
-    } else {
+    if (SetupSd0x34KeyY(true, movable_keyY) != 0)
         return 1; // movable.sed has to be present in NAND
-    }
     
     Debug("");
     if (SdFolderSelector(basepath, movable_keyY) != 0)
@@ -1264,14 +1203,19 @@ u32 DecryptSdFilesDirect(u32 param) {
         Debug("%2u: %s", n_processed, srcpath + bplen);
         if (FileOpen(srcpath)) {
             fsize = FileGetSize();
-            FileCopyTo(dstpath, BUFFER_ADDRESS, BUFFER_MAX_SIZE);
+            if (!DebugCheckFreeSpace(fsize))
+                return 1;
+            if (FileCopyTo(dstpath, BUFFER_ADDRESS, BUFFER_MAX_SIZE) != fsize) {
+                Debug("Could not copy: %s", srcpath + bplen);
+                n_failed++;
+            }
             FileClose();
         } else {
             Debug("Could not open: %s", srcpath + bplen);
             n_failed++;
             continue;
         }
-        if (CryptSdToSd(dstpath, 0, fsize, &info) == 0) {
+        if (CryptSdToSd(dstpath, 0, fsize, &info, true) == 0) {
             n_processed++;
         } else {
             Debug("Failed!");

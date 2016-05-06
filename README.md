@@ -1,5 +1,3 @@
-# Agbsave9
-_Tool to extract and inject agb_firm saves._
 
 ## How to use
 1. Open the AGB_FIRM game you want to extract the save from.

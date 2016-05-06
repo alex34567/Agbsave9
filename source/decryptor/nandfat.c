@@ -8,7 +8,7 @@
 #include "decryptor/nandfat.h"
 
 // only a subset, see http://3dbrew.org/wiki/Title_list
-// regions: JPN, USA,EUR, CHN, KOR, TWN
+// regions: JPN, USA, EUR, CHN, KOR, TWN
 TitleListInfo titleList[] = {
     { "System Settings"       , 0x00040010, { 0x00020000, 0x00021000, 0x00022000, 0x00026000, 0x00027000, 0x00028000 } },
     { "Download Play"         , 0x00040010, { 0x00020100, 0x00021100, 0x00022100, 0x00026100, 0x00027100, 0x00028100 } },
@@ -33,7 +33,8 @@ NandFileInfo fileList[] = {
     { "movable.sed",           "movable.sed",           "PRIVATE    MOVABLE SED",                P_CTRNAND },
     { "seedsave.bin", "seedsave.bin", "DATA       ???????????SYSDATA    0001000F   00000000   ", P_CTRNAND },
     { "nagsave.bin",  "nagsave.bin",  "DATA       ???????????SYSDATA    0001002C   00000000   ", P_CTRNAND },
-    { "nnidsave.bin", "nnidsave.bin", "DATA       ???????????SYSDATA    00010038   00000000   ", P_CTRNAND }
+    { "nnidsave.bin", "nnidsave.bin", "DATA       ???????????SYSDATA    00010038   00000000   ", P_CTRNAND },
+    { "friendsave.bin", "friendsave.bin", "DATA       ???????????SYSDATA    00010032   00000000   ", P_CTRNAND }
 };
 
 
@@ -62,7 +63,8 @@ u32 SeekFileInNand(u32* offset, u32* size, const char* path, PartitionInfo* part
     if (strnlen(path, 256) % (8+3) != 0)
         return 1;
     
-    DecryptNandToMem(buffer, p_offset, NAND_SECTOR_SIZE, partition);
+    if (DecryptNandToMem(buffer, p_offset, NAND_SECTOR_SIZE, partition) != 0)
+        return 1;
     
     // good FAT header description found here: http://www.compuphase.com/mbr_fat.htm
     u32 fat_start = NAND_SECTOR_SIZE * getle16(buffer + 0x0E);
@@ -76,9 +78,10 @@ u32 SeekFileInNand(u32* offset, u32* size, const char* path, PartitionInfo* part
         if (*offset - p_offset > p_size)
             return 1;
         found = false;
-        DecryptNandToMem(buffer, *offset, cluster_size, partition);
+        if (DecryptNandToMem(buffer, *offset, cluster_size, partition) != 0)
+            return 1;
         for (u32 i = 0x00; i < cluster_size; i += 0x20) {
-            const static char zeroes[8+3] = { 0x00 };
+            static const char zeroes[8+3] = { 0x00 };
             // skip invisible, deleted and lfn entries
             if ((buffer[i] == '.') || (buffer[i] == 0xE5) || (buffer[i+0x0B] == 0x0F))
                 continue;
@@ -101,7 +104,8 @@ u32 SeekFileInNand(u32* offset, u32* size, const char* path, PartitionInfo* part
     if (found && (*size > cluster_size)) {  
         if (fat_size / fat_count > 0x100000) // prevent buffer overflow
             return 1; // fishy FAT table size - should never happen
-        DecryptNandToMem(buffer, p_offset + fat_start, fat_size / fat_count, partition);
+        if (DecryptNandToMem(buffer, p_offset + fat_start, fat_size / fat_count, partition) != 0)
+            return 1;
         for (u32 i = 0; i < (*size - 1) / cluster_size; i++) {
             if (*(((u16*) buffer) + fat_pos + i) != fat_pos + i + 1)
                 return 1;
@@ -249,7 +253,7 @@ u32 DumpFile(u32 param)
     
     if (DebugSeekFileInNand(&offset, &size, f_info->name_l, f_info->path, p_info) != 0)
         return 1;
-    if (OutputFileNameSelector(filename, f_info->name_l, NULL, (param & N_EMUNAND)) != 0)
+    if (OutputFileNameSelector(filename, f_info->name_l, NULL) != 0)
         return 1;
     if (DecryptNandToFile(filename, offset, size, p_info) != 0)
         return 1;
@@ -270,7 +274,7 @@ u32 InjectFile(u32 param)
     
     if (DebugSeekFileInNand(&offset, &size, f_info->name_l, f_info->path, p_info) != 0)
         return 1;
-    if (InputFileNameSelector(filename, f_info->name_s, NULL, NULL, 0, size) != 0)
+    if (InputFileNameSelector(filename, f_info->name_s, NULL, NULL, 0, size, false) != 0)
         return 1;
     if (EncryptFileToNand(filename, offset, size, p_info) != 0)
         return 1;
@@ -280,8 +284,10 @@ u32 InjectFile(u32 param)
 
 u32 DumpHealthAndSafety(u32 param)
 {
+    (void) (param); // param is unused here
     PartitionInfo* ctrnand_info = GetPartitionInfo(P_CTRNAND);
     TitleListInfo* health = titleList + ((GetUnitPlatform() == PLATFORM_3DS) ? 3 : 4);
+    TitleListInfo* health_alt = (GetUnitPlatform() == PLATFORM_N3DS) ? titleList + 3 : NULL;
     char filename[64];
     u32 offset_app[4];
     u32 size_app[4];
@@ -289,9 +295,10 @@ u32 DumpHealthAndSafety(u32 param)
     u32 size_tmd;
     
     
-    if (DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health, 4) != 0)
+    if ((DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health, 4) != 0) && (!health_alt || 
+        (DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health_alt, 4) != 0)))
         return 1;
-    if (OutputFileNameSelector(filename, "hs.app", NULL, (param & N_EMUNAND)) != 0)
+    if (OutputFileNameSelector(filename, "hs.app", NULL) != 0)
         return 1;
         
     Debug("Dumping & decrypting APP0...");
@@ -308,6 +315,7 @@ u32 InjectHealthAndSafety(u32 param)
     u8* buffer = BUFFER_ADDRESS;
     PartitionInfo* ctrnand_info = GetPartitionInfo(P_CTRNAND);
     TitleListInfo* health = titleList + ((GetUnitPlatform() == PLATFORM_3DS) ? 3 : 4);
+    TitleListInfo* health_alt = (GetUnitPlatform() == PLATFORM_N3DS) ? titleList + 3 : NULL;
     NcchHeader* ncch = (NcchHeader*) 0x20316000;
     char filename[64];
     u32 offset_app[4];
@@ -320,7 +328,8 @@ u32 InjectHealthAndSafety(u32 param)
     if (!(param & N_NANDWRITE)) // developer screwup protection
         return 1;
     
-    if (DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health, 4) != 0)
+    if ((DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health, 4) != 0) && (!health_alt || 
+        (DebugSeekTitleInNand(&offset_tmd, &size_tmd, offset_app, size_app, health_alt, 4) != 0)))
         return 1;
     if (size_app[0] > 0x400000) {
         Debug("H&S system app is too big!");
@@ -328,7 +337,7 @@ u32 InjectHealthAndSafety(u32 param)
     }
     if (DecryptNandToMem((void*) ncch, offset_app[0], 0x200, ctrnand_info) != 0)
         return 1;
-    if (InputFileNameSelector(filename, NULL, "app", ncch->signature, 0x100, 0) != 0)
+    if (InputFileNameSelector(filename, NULL, "app", ncch->signature, 0x100, 0, false) != 0)
         return 1;
     
     if (!DebugFileOpen(filename))
@@ -372,19 +381,114 @@ u32 InjectHealthAndSafety(u32 param)
     for (u32 i = 0, kc = 0; i < 64 && kc < cnt_count; i++) {
         u32 k = getbe16(tmd_data + 0xC4 + (i * 0x24) + 0x02);
         u8* chunk_hash = tmd_data + 0xC4 + (i * 0x24) + 0x04;
-        sha_init(SHA256_MODE);
-        sha_update(content_list + kc * 0x30, k * 0x30);
-        sha_get(chunk_hash);
+        sha_quick(chunk_hash, content_list + kc * 0x30, k * 0x30, SHA256_MODE);
         kc += k;
     }
     u8* tmd_hash = tmd_data + 0xA4;
-    sha_init(SHA256_MODE);
-    sha_update(tmd_data + 0xC4, 64 * 0x24);
-    sha_get(tmd_hash);
+    sha_quick(tmd_hash, tmd_data + 0xC4, 64 * 0x24, SHA256_MODE);
     tmd_data = (u8*) 0x20316000;
     if (EncryptMemToNand(tmd_data, offset_tmd, size_tmd, ctrnand_info) != 0)
         return 1; 
     
+    
+    return 0;
+}
+
+u32 UpdateSeedDb(u32 param)
+{
+    (void) (param); // param is unused here
+    PartitionInfo* ctrnand_info = GetPartitionInfo(P_CTRNAND);
+    u8* buffer = BUFFER_ADDRESS;
+    SeedInfo *seedinfo = (SeedInfo*) 0x20400000;
+    
+    u32 nNewSeeds = 0;
+    u32 offset;
+    u32 size;
+    
+    // load full seedsave to memory
+    Debug("Searching for seedsave...");
+    if (SeekFileInNand(&offset, &size, "DATA       ???????????SYSDATA    0001000F   00000000   ", ctrnand_info) != 0) {
+        Debug("Failed!");
+        return 1;
+    }
+    Debug("Found at %08X, size %ukB", offset, size / 1024);
+    if (size != 0xAC000) {
+        Debug("Expected %ukB, failed!", 0xAC000);
+        return 1;
+    }
+    if (DecryptNandToMem(buffer, offset, size, ctrnand_info) != 0)
+        return 1;
+    
+    // load / create seeddb.bin
+    if (DebugFileOpen("seeddb.bin")) {
+        if (!DebugFileRead(seedinfo, 16, 0)) {
+            FileClose();
+            return 1;
+        }
+        if (seedinfo->n_entries > MAX_ENTRIES) {
+            Debug("seeddb.bin seems to be corrupt!");
+            FileClose();
+            return 1;
+        }
+        if (!DebugFileRead(seedinfo->entries, seedinfo->n_entries * sizeof(SeedInfoEntry), 16)) {
+            FileClose();
+            return 1;
+        }
+    } else {
+        if (!DebugFileCreate("seeddb.bin", true))
+            return 1;
+        memset(seedinfo, 0x00, 16);
+        DebugFileWrite(seedinfo, 16, 0);
+    }
+    
+    // search and extract seeds
+    for ( int n = 0; n < 2; n++ ) {
+        // there are two offsets where seeds can be found - 0x07000 & 0x5C000
+        static const int seed_offsets[2] = {0x7000, 0x5C000};
+        unsigned char* seed_data = buffer + seed_offsets[n];
+        for ( size_t i = 0; i < 2000; i++ ) {
+            static const u8 zeroes[16] = { 0x00 };
+            // magic number is the reversed first 4 byte of a title id
+            static const u8 magic[4] = { 0x00, 0x00, 0x04, 0x00 };
+            // 2000 seed entries max, splitted into title id and seed area
+            u8* titleId = seed_data + (i*8);
+            u8* seed = seed_data + (2000*8) + (i*16);
+            if (memcmp(titleId + 4, magic, 4) != 0)
+                continue;
+            // Bravely Second demo seed workaround
+            if (memcmp(seed, zeroes, 16) == 0)
+                seed = buffer + seed_offsets[(n+1)%2] + (2000 * 8) + (i*16);
+            if (memcmp(seed, zeroes, 16) == 0)
+                continue;
+            // seed found, check if it already exists
+            u32 entryPos = 0;
+            for (entryPos = 0; entryPos < seedinfo->n_entries; entryPos++)
+                if (memcmp(titleId, &(seedinfo->entries[entryPos].titleId), 8) == 0)
+                    break;
+            if (entryPos < seedinfo->n_entries) {
+                Debug("Found %08X%08X seed (duplicate)", getle32(titleId + 4), getle32(titleId));
+                continue;
+            }
+            // seed is new, create a new entry
+            Debug("Found %08X%08X seed (new)", getle32(titleId + 4), getle32(titleId));
+            memset(&(seedinfo->entries[entryPos]), 0x00, sizeof(SeedInfoEntry));
+            memcpy(&(seedinfo->entries[entryPos].titleId), titleId, 8);
+            memcpy(&(seedinfo->entries[entryPos].external_seed), seed, 16);
+            seedinfo->n_entries++;
+            nNewSeeds++;
+        }
+    }
+    
+    if (nNewSeeds == 0) {
+        Debug("Found no new seeds, %i total", seedinfo->n_entries);
+        FileClose();
+        return 0;
+    }
+    
+    Debug("Found %i new seeds, %i total", nNewSeeds, seedinfo->n_entries);
+    if (!DebugFileWrite(seedinfo, 16 + seedinfo->n_entries * sizeof(SeedInfoEntry), 0))
+        return 1;
+    FileClose();
     
     return 0;
 }
